@@ -14,7 +14,7 @@ import threading
 
 # ---------- CONFIG ----------
 MAX_RUNTIME = 5.5 * 3600
-MIN_DELAY = 0.05            # 50ms between DNS queries (20 checks/sec)
+MIN_DELAY = 0.02            
 FILTER_LEVEL = 7.5
 FILTER_LEVEL_6 = 7.0
 OUTPUT_FILE = "finds.txt"
