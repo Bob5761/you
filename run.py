@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-import requests, random, time, os, sys, threading
+import requests, random, time, os, sys, threading, queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ---------- CONFIG ----------
 MAX_RUNTIME = 5.5 * 3600
-PROXY_REFRESH = 50
 MIN_DELAY, MAX_DELAY = 0.9, 1.6
-FILTER_LEVEL = 7.5            # آستانه زیبایی (قبلاً 8.0 بود)
+FILTER_LEVEL = 7.5
+FILTER_LEVEL_6 = 7.0
 OUTPUT_FILE = "finds.txt"
 REPORT_FILE = "report.md"
 TRIED_FILE = "seen.txt"
@@ -40,6 +42,50 @@ ALL_ATOMS = ATOMS_2 + ATOMS_3
 
 VIP_TARGETS = ["queen","king","magic","dream","sword","power","blade","ghost","storm","crown","angel","money","ethos","pixel","cyber","crypt","vault","brave","flare","glide","flame","shine","ocean","royal","noble","valor","spark","vivid","zesty","lunar","prime","frost","crisp","brisk","plush","swift","quest","haven","charm","grace","bliss","unity","zonal","vapor","zenith","elite","gloom","mirth","glyph","nymph"]
 
+# ----- Proxy Pool with background feeder -----
+class ProxyPool:
+    def __init__(self, min_size=20, refresh_interval=30):
+        self.queue = queue.Queue()
+        self.min_size = min_size
+        self.refresh_interval = refresh_interval
+        self._stop_event = threading.Event()
+        self._feeder_thread = None
+
+    def start(self):
+        self._feeder_thread = threading.Thread(target=self._feeder, daemon=True)
+        self._feeder_thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def get(self):
+        try:
+            return self.queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def put(self, proxy):
+        self.queue.put(proxy)
+
+    def size(self):
+        return self.queue.qsize()
+
+    def _feeder(self):
+        while not self._stop_event.is_set():
+            if self.queue.qsize() < self.min_size:
+                self._refill()
+            time.sleep(self.refresh_interval)
+
+    def _refill(self):
+        fresh = all_proxies()
+        if fresh:
+            good = filter_good(fresh, sample=60)
+            for p in good:
+                if self.queue.qsize() >= self.min_size * 2:
+                    break
+                self.queue.put(p)
+
+# ----- Utility functions -----
 def load_wordlist():
     try:
         r = requests.get(WORDLIST_URL, timeout=15)
@@ -105,6 +151,23 @@ def gen_atom(tried):
             cand=cand[:pos]+random.choice("17")+cand[pos+1:]
         if cand not in tried: return cand
 
+def gen_6char(tried):
+    """تولید آیدی ۶ کاراکتری: ۴ حرف + ۲ عدد یا ۵ حرف + ۱ عدد، الگوی برندی"""
+    while True:
+        # ۴ حرف + ۲ عدد
+        if random.random()<0.5:
+            letters = ''.join(random.choices("abcdefghijklmnopqrstuvwxyz", k=4))
+            digits = ''.join(random.choices("0123456789", k=2))
+            cand = letters + digits
+        else:
+            # ۵ حرف + ۱ عدد
+            letters = ''.join(random.choices("abcdefghijklmnopqrstuvwxyz", k=5))
+            digit = random.choice("0123456789")
+            pos = random.randint(0,5)
+            cand = letters[:pos] + digit + letters[pos:]
+        if len(cand)==6 and cand not in tried:
+            return cand
+
 def fetch_proxies(url):
     try:
         r = requests.get(url, timeout=8)
@@ -112,49 +175,62 @@ def fetch_proxies(url):
             return [l.strip() for l in r.text.splitlines() if l.strip()]
     except Exception:
         pass
-    return []   # ← دیگر None برنمی‌گرداند
+    return []
 
 def all_proxies():
     p=[]
     for u in PROXY_URLS: p.extend(fetch_proxies(u))
     return list(set(p))
+
 def test_proxy(p):
     try:
-        r=requests.get("http://httpbin.org/ip",proxies={"http":f"http://{p}","https":f"http://{p}"},timeout=4)
-        return r.status_code==200
-    except: return False
-def filter_good(pool,sample=50):
-    sample=min(sample,len(pool)); test=random.sample(pool,sample); good=[]
-    with ThreadPoolExecutor(max_workers=15) as ex:
-        futs={ex.submit(test_proxy,p):p for p in test}
-        for f in as_completed(futs):
-            p=futs[f]
-            if f.result(): good.append(p)
+        r = requests.get("https://t.me/",
+                         proxies={"http": f"http://{p}", "https": f"http://{p}"},
+                         timeout=4)
+        return r.status_code == 200 and "telegram" in r.text.lower()
+    except:
+        return False
+
+def filter_good(pool, sample=50):
+    if not pool: return []
+    sample = min(sample, len(pool))
+    test_s = random.sample(pool, sample)
+    good = []
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        futures = {ex.submit(test_proxy, p): p for p in test_s}
+        for f in as_completed(futures):
+            p = futures[f]
+            if f.result():
+                good.append(p)
     return good
-def refill(good,min_size=20):
-    if len(good)>=min_size: return good
-    ap=all_proxies()
-    if not ap: return good
-    fresh=filter_good(ap,60)
-    comb=list(set(good+fresh))
-    if len(comb)<min_size: comb=(comb+ap)[:min_size]
-    return comb
-def check(name, good_pool, retries=3):
-    # تلاش با پروکسی
+
+def check(name, proxy_pool, retries=2):
+    session = requests.Session()
+    retry_strategy = Retry(total=1, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+
     for _ in range(retries):
-        if not good_pool: break
-        p = random.choice(good_pool)
+        p = proxy_pool.get()
+        if not p:
+            break
         proxy = {"http": f"http://{p}", "https": f"http://{p}"}
         try:
-            r = requests.get(f"https://t.me/{name}", headers={"User-Agent": "Mozilla/5.0"}, timeout=8, proxies=proxy)
-            if "doesn't exist" in r.text.lower(): return True
-            return False
+            r = session.get(f"https://t.me/{name}", headers={"User-Agent": "Mozilla/5.0"}, timeout=6, proxies=proxy)
+            if "doesn't exist" in r.text.lower():
+                proxy_pool.put(p)
+                return True
+            else:
+                proxy_pool.put(p)
+                return False
         except:
-            if p in good_pool: good_pool.remove(p)
-    # fallback بدون پروکسی
+            continue
+
+    # fallback مستقیم
     try:
-        r = requests.get(f"https://t.me/{name}", headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-        if "doesn't exist" in r.text.lower(): return True
+        r = session.get(f"https://t.me/{name}", headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+        if "doesn't exist" in r.text.lower():
+            return True
         return False
     except:
         return None
@@ -165,54 +241,64 @@ def alert(name,score):
     try: requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",json={"chat_id":TG_CHAT_ID,"text":txt,"parse_mode":"Markdown"},timeout=10)
     except: pass
 
-def vip_sniper(vips,lock,good_pool,tried,found,wset,stop):
+def vip_sniper(vips, lock, proxy_pool, tried, found, wset, stop):
     while not stop.is_set():
         random.shuffle(vips)
         for user in vips:
             if stop.is_set(): break
             if user in tried: continue
-            with lock: snap=list(good_pool)
-            st=check(user,snap)
-            with lock: tried.add(user)
+            st = check(user, proxy_pool)
+            if st is not None:      # فقط در صورت نتیجهٔ قطعی به tried اضافه کن
+                with lock: tried.add(user)
             if st is True:
-                sc=calc_score(user,wset)
-                if sc>=FILTER_LEVEL:
-                    with lock: found.append((user,sc))
-                    alert(user,sc)
+                sc = calc_score(user, wset)
+                if sc >= FILTER_LEVEL:
+                    with lock: found.append((user, sc))
+                    alert(user, sc)
                     print(f"🎯 VIP SNIPE: @{user} (score {sc:.1f})")
-            elif st is False: print(f"🔒 VIP still taken: @{user}")
-            else: print(f"⚠️ VIP check failed: @{user}")
-            time.sleep(random.uniform(1.0,2.0))
+            elif st is False:
+                print(f"🔒 VIP still taken: @{user}")
+            else:
+                print(f"⚠️ VIP check failed: @{user}")
+            time.sleep(random.uniform(1.0, 2.0))
         time.sleep(VIP_CHECK_INTERVAL)
 
+# ----- Main -----
 def main():
-    start=time.time()
-    scrabble=load_wordlist()
+    start = time.time()
+    scrabble = load_wordlist()
     dream_words = list(set(scrabble + VIP_TARGETS))
-    wset=set(scrabble)
+    wset = set(scrabble)
     print(f"📚 Seed words: {len(dream_words)}")
-    tried=set()
+
+    tried = set()
     if os.path.exists(TRIED_FILE):
-        with open(TRIED_FILE) as f: tried=set(line.strip() for line in f)
-    good=[]
-    good=refill(good,20)
-    lock=threading.Lock()
-    found=[]
-    chk=0
-    stop=threading.Event()
-    vip=threading.Thread(target=vip_sniper,args=(VIP_TARGETS,lock,good,tried,found,wset,stop),daemon=True)
+        with open(TRIED_FILE) as f:
+            tried = set(line.strip() for line in f)
+
+    proxy_pool = ProxyPool(min_size=20, refresh_interval=30)
+    proxy_pool.start()
+    time.sleep(5)
+    print(f"✅ Initial proxies: {proxy_pool.size()}")
+
+    lock = threading.Lock()
+    found = []
+    chk = 0
+    stop = threading.Event()
+    vip = threading.Thread(target=vip_sniper, args=(VIP_TARGETS, lock, proxy_pool, tried, found, wset, stop), daemon=True)
     vip.start()
+
+    # زمان‌بندی فازها: 80% اتم ۵ حرفی، 20% شش‌حرفی
+    phase1_end = start + MAX_RUNTIME * 0.8
     try:
-        # ===== Phase 1 (PRIORITY): Brand Atoms =====
-        print("\n⚛️ Phase 1: Brand Atoms (priority)...")
-        while time.time() - start < MAX_RUNTIME * 0.8:
-            if chk % PROXY_REFRESH == 0:
-                with lock: good = refill(good, 20)
+        # فاز ۱: Brand Atoms (۵ حرفی)
+        print("\n⚛️ Phase 1: Brand Atoms (80% time)...")
+        while time.time() - start < phase1_end:
             cand = gen_atom(tried)
-            with lock: snap = list(good)
-            st = check(cand, snap)
+            st = check(cand, proxy_pool)
             chk += 1
-            with lock: tried.add(cand)
+            if st is not None:
+                with lock: tried.add(cand)
             if st is True:
                 sc = calc_score(cand, wset)
                 if sc >= FILTER_LEVEL:
@@ -228,7 +314,7 @@ def main():
                     for u in list(tried)[-10:]: f.write(u + "\n")
             time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
-        # ===== Phase 2: Words & Palindromes =====
+        # فاز ۲: Words & Palindromes (۵ حرفی)
         print("\n💎 Phase 2: Words & Palindromes...")
         combined = list(set(dream_words + [w for w in scrabble if w == w[::-1]]))
         random.shuffle(combined)
@@ -237,12 +323,10 @@ def main():
             for cand in variants_from_word(w):
                 if time.time() - start > MAX_RUNTIME: break
                 if cand in tried: continue
-                if chk % PROXY_REFRESH == 0:
-                    with lock: good = refill(good, 20)
-                with lock: snap = list(good)
-                st = check(cand, snap)
+                st = check(cand, proxy_pool)
                 chk += 1
-                with lock: tried.add(cand)
+                if st is not None:
+                    with lock: tried.add(cand)
                 if st is True:
                     sc = calc_score(cand, wset)
                     if sc >= FILTER_LEVEL:
@@ -258,15 +342,40 @@ def main():
                         for u in list(tried)[-10:]: f.write(u + "\n")
                 time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
+        # فاز ۳: ۶ رقمی (۲۰٪ زمان باقی‌مانده)
+        print("\n🔢 Phase 3: 6-char usernames (remaining time)...")
+        while time.time() - start < MAX_RUNTIME:
+            cand = gen_6char(tried)
+            st = check(cand, proxy_pool)
+            chk += 1
+            if st is not None:
+                with lock: tried.add(cand)
+            if st is True:
+                sc = calc_score(cand, wset)  # استفاده از همان تابع (با طول ۶ ممکن است کمی انحراف داشته باشد، ولی همچنان فیلتر می‌کند)
+                if sc >= FILTER_LEVEL_6:
+                    with lock: found.append((cand, sc))
+                    if sc >= 8.5: alert(cand, sc)
+                    print(f"🔢 6CHAR: @{cand} (score {sc:.1f})")
+            elif st is False:
+                print(f"❌ @{cand}")
+            else:
+                print(f"⚠️ @{cand}")
+            if chk % 10 == 0:
+                with open(TRIED_FILE, "a") as f:
+                    for u in list(tried)[-10:]: f.write(u + "\n")
+            time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+
     finally:
         stop.set()
         vip.join(timeout=5)
-    with open(TRIED_FILE,"w") as f:
-        for u in tried: f.write(u+"\n")
-    found.sort(key=lambda x:x[1],reverse=True)
-    with open(OUTPUT_FILE,"w") as f:
+        proxy_pool.stop()
+
+    with open(TRIED_FILE, "w") as f:
+        for u in tried: f.write(u + "\n")
+    found.sort(key=lambda x: x[1], reverse=True)
+    with open(OUTPUT_FILE, "w") as f:
         for n,s in found: f.write(f"{n} (score {s:.1f})\n")
-    with open(REPORT_FILE,"w") as f:
+    with open(REPORT_FILE, "w") as f:
         f.write("# Report\n")
         f.write(f"**Found:** {len(found)}\n\n")
         f.write("| Rank | Username | Beauty | Est. Value |\n")
