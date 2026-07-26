@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 MAX_RUNTIME = 5.5 * 3600
 PROXY_REFRESH = 50
 MIN_DELAY, MAX_DELAY = 0.9, 1.6
-BEAUTY_THRESHOLD = 8.0
+FILTER_LEVEL = 7.5            # آستانه زیبایی (قبلاً 8.0 بود)
 OUTPUT_FILE = "finds.txt"
 REPORT_FILE = "report.md"
 TRIED_FILE = "seen.txt"
@@ -48,7 +48,7 @@ def load_wordlist():
     except: pass
     return []
 
-def beauty(name, wset=None):
+def calc_score(name, wset=None):
     s = 5.0
     vv = set("aeiou"); v = sum(1 for c in name if c in vv); cc = 5-v
     if v in (2,3): s+=1.5
@@ -113,6 +113,7 @@ def fetch_proxies(url):
     except Exception:
         pass
     return []   # ← دیگر None برنمی‌گرداند
+
 def all_proxies():
     p=[]
     for u in PROXY_URLS: p.extend(fetch_proxies(u))
@@ -138,18 +139,26 @@ def refill(good,min_size=20):
     comb=list(set(good+fresh))
     if len(comb)<min_size: comb=(comb+ap)[:min_size]
     return comb
-def check(name,good_pool,retries=3):
+def check(name, good_pool, retries=3):
+    # تلاش با پروکسی
     for _ in range(retries):
         if not good_pool: break
-        p=random.choice(good_pool)
-        proxy={"http":f"http://{p}","https":f"http://{p}"}
+        p = random.choice(good_pool)
+        proxy = {"http": f"http://{p}", "https": f"http://{p}"}
         try:
-            r=requests.get(f"https://t.me/{name}",headers={"User-Agent":"Mozilla/5.0"},timeout=8,proxies=proxy)
+            r = requests.get(f"https://t.me/{name}", headers={"User-Agent": "Mozilla/5.0"}, timeout=8, proxies=proxy)
             if "doesn't exist" in r.text.lower(): return True
             return False
         except:
             if p in good_pool: good_pool.remove(p)
-    return None
+    # fallback بدون پروکسی
+    try:
+        r = requests.get(f"https://t.me/{name}", headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        if "doesn't exist" in r.text.lower(): return True
+        return False
+    except:
+        return None
+
 def alert(name,score):
     if not TG_BOT_TOKEN or not TG_CHAT_ID: return
     txt=f"💎 *Luxury Diamond!*\n`@{name}`\nScore: {score:.1f}"
@@ -166,8 +175,8 @@ def vip_sniper(vips,lock,good_pool,tried,found,wset,stop):
             st=check(user,snap)
             with lock: tried.add(user)
             if st is True:
-                sc=beauty(user,wset)
-                if sc>=BEAUTY_THRESHOLD:
+                sc=calc_score(user,wset)
+                if sc>=FILTER_LEVEL:
                     with lock: found.append((user,sc))
                     alert(user,sc)
                     print(f"🎯 VIP SNIPE: @{user} (score {sc:.1f})")
@@ -179,9 +188,9 @@ def vip_sniper(vips,lock,good_pool,tried,found,wset,stop):
 def main():
     start=time.time()
     scrabble=load_wordlist()
-    words=list(set(scrabble+VIP_TARGETS))
+    dream_words = list(set(scrabble + VIP_TARGETS))
     wset=set(scrabble)
-    print(f"📚 Seed words: {len(words)}")
+    print(f"📚 Seed words: {len(dream_words)}")
     tried=set()
     if os.path.exists(TRIED_FILE):
         with open(TRIED_FILE) as f: tried=set(line.strip() for line in f)
@@ -194,78 +203,61 @@ def main():
     vip=threading.Thread(target=vip_sniper,args=(VIP_TARGETS,lock,good,tried,found,wset,stop),daemon=True)
     vip.start()
     try:
-        print("💎 Phase 1: Dream Words")
-        random.shuffle(words)
-        for w in words:
-            if time.time()-start>MAX_RUNTIME: break
-            for cand in variants_from_word(w):
-                if time.time()-start>MAX_RUNTIME: break
-                if cand in tried: continue
-                if chk%PROXY_REFRESH==0:
-                    with lock: good=refill(good,20)
-                with lock: snap=list(good)
-                st=check(cand,snap)
-                chk+=1
-                with lock: tried.add(cand)
-                if st is True:
-                    sc=beauty(cand,wset)
-                    if sc>=BEAUTY_THRESHOLD:
-                        with lock: found.append((cand,sc))
-                        if sc>=9.0: alert(cand,sc)
-                        print(f"✨ WORD: @{cand} (score {sc:.1f})")
-                elif st is False: print(f"❌ @{cand}")
-                else: print(f"⚠️ @{cand}")
-                if chk%10==0:
-                    with open(TRIED_FILE,"a") as f:
-                        for u in list(tried)[-10:]: f.write(u+"\n")
-                time.sleep(random.uniform(MIN_DELAY,MAX_DELAY))
-        print("\n🔄 Phase 2: Palindromes")
-        pals=list({w for w in scrabble if w==w[::-1]})
-        random.shuffle(pals)
-        for w in pals:
-            if time.time()-start>MAX_RUNTIME: break
-            for cand in variants_from_word(w):
-                if time.time()-start>MAX_RUNTIME: break
-                if cand in tried: continue
-                if chk%PROXY_REFRESH==0:
-                    with lock: good=refill(good,20)
-                with lock: snap=list(good)
-                st=check(cand,snap)
-                chk+=1
-                with lock: tried.add(cand)
-                if st is True:
-                    sc=beauty(cand,wset)
-                    if sc>=BEAUTY_THRESHOLD:
-                        with lock: found.append((cand,sc))
-                        if sc>=9.0: alert(cand,sc)
-                        print(f"🌀 PAL: @{cand} (score {sc:.1f})")
-                elif st is False: print(f"❌ @{cand}")
-                else: print(f"⚠️ @{cand}")
-                if chk%10==0:
-                    with open(TRIED_FILE,"a") as f:
-                        for u in list(tried)[-10:]: f.write(u+"\n")
-                time.sleep(random.uniform(MIN_DELAY,MAX_DELAY))
-        print("\n⚛️ Phase 3: Brand Atoms")
-        while time.time()-start<MAX_RUNTIME:
-            if chk%PROXY_REFRESH==0:
-                with lock: good=refill(good,20)
-            cand=gen_atom(tried)
-            with lock: snap=list(good)
-            st=check(cand,snap)
-            chk+=1
+        # ===== Phase 1 (PRIORITY): Brand Atoms =====
+        print("\n⚛️ Phase 1: Brand Atoms (priority)...")
+        while time.time() - start < MAX_RUNTIME * 0.8:
+            if chk % PROXY_REFRESH == 0:
+                with lock: good = refill(good, 20)
+            cand = gen_atom(tried)
+            with lock: snap = list(good)
+            st = check(cand, snap)
+            chk += 1
             with lock: tried.add(cand)
             if st is True:
-                sc=beauty(cand,wset)
-                if sc>=BEAUTY_THRESHOLD:
-                    with lock: found.append((cand,sc))
-                    if sc>=9.0: alert(cand,sc)
+                sc = calc_score(cand, wset)
+                if sc >= FILTER_LEVEL:
+                    with lock: found.append((cand, sc))
+                    if sc >= 9.0: alert(cand, sc)
                     print(f"⚛️ ATOM: @{cand} (score {sc:.1f})")
-            elif st is False: print(f"❌ @{cand}")
-            else: print(f"⚠️ @{cand}")
-            if chk%10==0:
-                with open(TRIED_FILE,"a") as f:
-                    for u in list(tried)[-10:]: f.write(u+"\n")
-            time.sleep(random.uniform(MIN_DELAY,MAX_DELAY))
+            elif st is False:
+                print(f"❌ @{cand}")
+            else:
+                print(f"⚠️ @{cand}")
+            if chk % 10 == 0:
+                with open(TRIED_FILE, "a") as f:
+                    for u in list(tried)[-10:]: f.write(u + "\n")
+            time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+
+        # ===== Phase 2: Words & Palindromes =====
+        print("\n💎 Phase 2: Words & Palindromes...")
+        combined = list(set(dream_words + [w for w in scrabble if w == w[::-1]]))
+        random.shuffle(combined)
+        for w in combined:
+            if time.time() - start > MAX_RUNTIME: break
+            for cand in variants_from_word(w):
+                if time.time() - start > MAX_RUNTIME: break
+                if cand in tried: continue
+                if chk % PROXY_REFRESH == 0:
+                    with lock: good = refill(good, 20)
+                with lock: snap = list(good)
+                st = check(cand, snap)
+                chk += 1
+                with lock: tried.add(cand)
+                if st is True:
+                    sc = calc_score(cand, wset)
+                    if sc >= FILTER_LEVEL:
+                        with lock: found.append((cand, sc))
+                        if sc >= 9.0: alert(cand, sc)
+                        print(f"✨ WORD/PAL: @{cand} (score {sc:.1f})")
+                elif st is False:
+                    print(f"❌ @{cand}")
+                else:
+                    print(f"⚠️ @{cand}")
+                if chk % 10 == 0:
+                    with open(TRIED_FILE, "a") as f:
+                        for u in list(tried)[-10:]: f.write(u + "\n")
+                time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+
     finally:
         stop.set()
         vip.join(timeout=5)
