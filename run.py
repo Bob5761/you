@@ -107,9 +107,12 @@ def gen_atom(tried):
 
 def fetch_proxies(url):
     try:
-        r=requests.get(url,timeout=8)
-        if r.status_code==200: return [l.strip() for l in r.text.splitlines() if l.strip()]
-    except: return []
+        r = requests.get(url, timeout=8)
+        if r.status_code == 200:
+            return [l.strip() for l in r.text.splitlines() if l.strip()]
+    except Exception:
+        pass
+    return []   # ← دیگر None برنمی‌گرداند
 def all_proxies():
     p=[]
     for u in PROXY_URLS: p.extend(fetch_proxies(u))
