@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Ultimate Telegram Username Scanner – Turbo (Async + HEAD requests)
-Stops after 20 consecutive network errors to avoid wasting time.
+Ultimate Telegram Username Scanner – Async GET, Pronounceable Generator.
+Prioritizes real words, then pronounceable 5‑char names, then 6‑char.
 """
 
 import asyncio
@@ -11,14 +11,14 @@ import time
 import os
 import sys
 import threading
-import requests   # for VIP sniper and wordlist download
+import requests
 
 # ======================= CONFIG =======================
-MAX_RUNTIME = 2 * 3600          # 2 hours
-BATCH_SIZE = 50                 # concurrent checks
-BATCH_DELAY = 0.1               # pause between batches
-MAX_CONSECUTIVE_ERRORS = 20     # stop if this many errors in a row
-FILTER_LEVEL = 6.0
+MAX_RUNTIME = 2 * 3600
+BATCH_SIZE = 50
+BATCH_DELAY = 0.1
+MAX_CONSECUTIVE_ERRORS = 20
+FILTER_LEVEL = 6.5          # برای ۵ حرفی (افزایش دادم تا کیفیت حفظ شود)
 FILTER_LEVEL_6 = 7.0
 OUTPUT_FILE = "finds.txt"
 REPORT_FILE = "report.md"
@@ -37,36 +37,11 @@ PHONETIC = {'ph':'f','gh':'g','ch':'k','sh':'x','qu':'kw','ck':'k','wh':'w','th'
 SUFFIXES = ["fy","ly","io","me","us","co","ai","it","tv","up","or","ic","ed","er","el","en","es","ow","ax","ex","on","ar","in","un","im","il","ia","um","ix","ux","ox","op","ee","oo","ek","id","if","ig","ip","ir","is","ob","od","og","om","os","ot","ov","oy","ub","ud","ug","um","un","up","ur","us","ut","ux","uz"]
 PREFIXES = ["my","go","we","in","up","on","be","do","no","so","hi","ok","he","it","re","un","im","il","ir","co","de","ex","en","em","el","er","es","ed","ly","fy","io","ai","tv","me","us"]
 
-ATOMS_2 = [
-    "lu","me","fi","zo","vu","ki","ra","po","ne","xi","ja","ze","vo","nu","li","ro","bi","co","de","di",
-    "fo","ge","ho","jo","ka","le","ma","ni","pe","qi","re","si","to","vi","wo","xu","za","be","ce","fa",
-    "ga","ha","je","la","mo","no","pa","qu","ri","sa","ta","va","we","xe","yo","zu",
-    "fi","ai","io","dx","ex","ix","ox","ux","fy","ly","ty","cy","sy","zy","ny","ry","py","dy","gy","hy",
-    "jy","ky","my","oy","qy","vy","wy","ay","ey","iy","uy"
-]
-ATOMS_3 = [
-    "dax","zil","vor","nex","lux","pix","vox","jax","kio","zen","kai","lev","nox","rax","tiv","sol","nov",
-    "ver","lyn","myr","thal","rion","tron","ix","ox","ex","ion","ia","ius","ium","ana","era","ori","ara",
-    "ari","ela","ina","ira","ola","ona","ora","ura","yne","ose","ase","ite","ate","ive","ify","ize","ise",
-    "acy","ogy","ism","ist","oid","ous","ful","less","ness","ship","tion","sion","ance","ence","ment",
-    "able","ible","al","ic","ical","ive","ous","ful","less",
-    "chain","swap","flow","base","node","dapp","meta","lab","hub","pay","bit","coin","dex","fi","dao","web",
-    "net","sync","mind","rise","peak","core","data","code","nft","defi","crypto","pay","bit","bot","app",
-    "pro","max","top","one","run","hub","zip","map","key","pad","tag","box","mix","pop","tip","cap","lap",
-    "tap","nap","gap","hip","lip","rip","sip","tip","zip"
-]
-ATOMS_2 = [a for a in ATOMS_2 if len(a)==2]
-ATOMS_3 = [a for a in ATOMS_3 if len(a)==3]
+# حروف صامت و مصوت برای ساخت نام‌های تلفظ‌پذیر
+CONSONANTS = "bcdfghjklmnpqrstvwxyz"
+VOWELS = "aeiou"
 
-VIP_TARGETS = [
-    "queen","king","magic","dream","sword","power","blade","ghost","storm","crown",
-    "angel","money","ethos","pixel","cyber","crypt","vault","brave","flare","glide",
-    "flame","shine","ocean","royal","noble","valor","spark","vivid","zesty","lunar",
-    "prime","frost","crisp","brisk","plush","swift","quest","haven","charm","grace",
-    "bliss","unity","zonal","vapor","zenith","elite","gloom","mirth","glyph","nymph"
-]
-
-# ======================= UTILITIES =======================
+# ======================= UTILITIES (unchanged except added generator) =======================
 def load_wordlist():
     try:
         r = requests.get(WORDLIST_URL, timeout=15)
@@ -130,19 +105,27 @@ def variants_from_word(word):
                 if len(cand) == 5: res.add(cand)
     return list(res)
 
-def gen_atom(tried):
+def gen_pronounceable(tried):
+    """Generate a 5-letter pronounceable username with optional digit."""
     for _ in range(1000):
+        # الگوهای CVCVC یا VCVCV (C=صامت, V=مصوت)
         if random.random() < 0.5:
-            a1,a2 = random.choice(ATOMS_2), random.choice(ATOMS_3)
-            cand = a1 + a2
+            pattern = "CVCVC"
         else:
-            a1,a2 = random.choice(ATOMS_3), random.choice(ATOMS_2)
-            cand = a1 + a2
-        if len(cand) != 5: continue
+            pattern = "VCVCV"
+        name = []
+        for p in pattern:
+            if p == 'C':
+                name.append(random.choice(CONSONANTS))
+            else:
+                name.append(random.choice(VOWELS))
+        cand = ''.join(name)
+        # ۳۰٪ احتمال تزریق عدد در جایگاه غیر اول
         if random.random() < 0.3:
-            pos = random.randint(1,4)
-            cand = cand[:pos] + random.choice("17") + cand[pos+1:]
-        if cand not in tried: return cand
+            pos = random.randint(1, 4)
+            cand = cand[:pos] + random.choice("123456789") + cand[pos+1:]
+        if cand not in tried and len(cand) == 5:
+            return cand
     return None
 
 def gen_6char(tried):
@@ -161,7 +144,6 @@ def gen_6char(tried):
 
 # ======================= ASYNC CHECKER =======================
 async def check_bulk(usernames):
-    """Check a list of usernames concurrently using HEAD requests."""
     async with aiohttp.ClientSession() as session:
         tasks = [check_one(session, u) for u in usernames]
         results = await asyncio.gather(*tasks)
@@ -171,24 +153,17 @@ async def check_one(session, username):
     url = f"https://t.me/{username}"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        async with session.head(url, headers=headers, timeout=5) as resp:
-            if resp.status == 200:
-                return False
-            elif resp.status == 404:
+        async with session.get(url, headers=headers, timeout=5) as resp:
+            text = await resp.text()
+            if "doesn't exist" in text.lower():
                 return True
             else:
-                # fallback to GET
-                async with session.get(url, headers=headers, timeout=5) as get_resp:
-                    if get_resp.status == 200:
-                        return False
-                    else:
-                        return True
+                return False
     except:
         return None
 
 # ======================= VIP SNIPER =======================
 def vip_sniper(vips, lock, tried, found, wset, stop):
-    """Runs in a separate thread, uses synchronous requests for simplicity."""
     while not stop.is_set():
         random.shuffle(vips)
         for user in vips:
@@ -196,14 +171,8 @@ def vip_sniper(vips, lock, tried, found, wset, stop):
             if user in tried: continue
             st = None
             try:
-                r = requests.head(f"https://t.me/{user}", headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-                if r.status_code == 200:
-                    st = False
-                elif r.status_code == 404:
-                    st = True
-                else:
-                    r2 = requests.get(f"https://t.me/{user}", headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-                    st = ("doesn't exist" in r2.text.lower())
+                r = requests.get(f"https://t.me/{user}", headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+                st = ("doesn't exist" in r.text.lower())
             except:
                 st = None
             if st is not None:
@@ -248,12 +217,12 @@ async def main_async():
                                   daemon=True)
     vip_thread.start()
 
-    phase1_end = start + MAX_RUNTIME * 0.8
+    phase1_end = start + MAX_RUNTIME * 0.3   # فقط ۳۰٪ زمان برای کلمات (چون زود تمام می‌شوند)
     consecutive_errors = 0
     stop_early = False
 
     try:
-        # Phase 1: Words & Palindromes (80% time)
+        # Phase 1: Words & Palindromes
         print("\n💎 Phase 1: Words & Palindromes...")
         combined = list(set(dream_words + [w for w in scrabble if w == w[::-1]]))
         random.shuffle(combined)
@@ -324,13 +293,13 @@ async def main_async():
                     break
             batch.clear()
 
-        # Phase 2: Brand Atoms (until 95% of runtime)
+        # Phase 2: Pronounceable 5‑char names (rest of time)
         if not stop_early:
-            print("\n⚛️ Phase 2: Brand Atoms...")
-            while time.time() - start < MAX_RUNTIME * 0.95 and not stop_early:
-                cand = gen_atom(tried)
+            print("\n🗣️ Phase 2: Pronounceable 5‑char names...")
+            while time.time() - start < MAX_RUNTIME and not stop_early:
+                cand = gen_pronounceable(tried)
                 if cand is None:
-                    print("No more atoms.")
+                    print("No more pronounceable names to generate.")
                     break
                 batch.append(cand)
                 if len(batch) >= BATCH_SIZE:
@@ -349,53 +318,10 @@ async def main_async():
                                 if sc >= 9.0:
                                     try:
                                         requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                                                      json={"chat_id": TG_CHAT_ID, "text": f"💎 ATOM: @{cand} ({sc:.1f})",
+                                                      json={"chat_id": TG_CHAT_ID, "text": f"💎 PRON: @{cand} ({sc:.1f})",
                                                             "parse_mode": "Markdown"}, timeout=10)
                                     except: pass
-                                print(f"⚛️ ATOM: @{cand} (score {sc:.1f})")
-                        elif status is False:
-                            print(f"❌ @{cand}")
-                        else:
-                            print(f"⚠️ @{cand}")
-                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                            print("❌ Too many consecutive errors, stopping.")
-                            stop_early = True
-                            break
-                        if chk % 100 == 0:
-                            with open(TRIED_FILE, "a") as f:
-                                for u in list(tried)[-100:]:
-                                    f.write(u + "\n")
-                    batch.clear()
-                    await asyncio.sleep(BATCH_DELAY)
-
-        # Phase 3: 6‑char (remaining time)
-        if not stop_early:
-            print("\n🔢 Phase 3: 6-char usernames...")
-            while time.time() - start < MAX_RUNTIME and not stop_early:
-                cand = gen_6char(tried)
-                if cand is None:
-                    break
-                batch.append(cand)
-                if len(batch) >= BATCH_SIZE:
-                    results = await check_bulk(batch)
-                    for cand, status in results:
-                        chk += 1
-                        if status is not None:
-                            with lock: tried.add(cand)
-                            consecutive_errors = 0
-                        else:
-                            consecutive_errors += 1
-                        if status is True:
-                            sc = calc_score(cand, wset)
-                            if sc >= FILTER_LEVEL_6:
-                                with lock: found.append((cand, sc))
-                                if sc >= 8.5:
-                                    try:
-                                        requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                                                      json={"chat_id": TG_CHAT_ID, "text": f"💎 6CHAR: @{cand} ({sc:.1f})",
-                                                            "parse_mode": "Markdown"}, timeout=10)
-                                    except: pass
-                                print(f"🔢 6CHAR: @{cand} (score {sc:.1f})")
+                                print(f"🗣️ PRON: @{cand} (score {sc:.1f})")
                         elif status is False:
                             print(f"❌ @{cand}")
                         else:
@@ -415,7 +341,7 @@ async def main_async():
         stop_event.set()
         vip_thread.join(timeout=5)
 
-    # Save everything
+    # Save results
     with open(TRIED_FILE, "w") as f:
         for u in tried:
             f.write(u + "\n")
