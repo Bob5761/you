@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Ultimate Telegram Username Scanner – Async GET, Pronounceable Generator.
-Prioritizes real words, then pronounceable 5‑char names, then 6‑char.
+Ultimate Telegram Username Scanner – accepts ALL free 5‑char usernames,
+sorts them by beauty score, intelligent pronouncable generation.
 """
 
 import asyncio
@@ -18,8 +18,8 @@ MAX_RUNTIME = 2 * 3600
 BATCH_SIZE = 50
 BATCH_DELAY = 0.1
 MAX_CONSECUTIVE_ERRORS = 20
-FILTER_LEVEL = 6.5          # برای ۵ حرفی (افزایش دادم تا کیفیت حفظ شود)
-FILTER_LEVEL_6 = 7.0
+FILTER_LEVEL = 0.0            # <-- هر ۵ رقمی آزاد قبول شود
+FILTER_LEVEL_6 = 7.0          # برای ۶ رقمی همچنان آستانه بالا
 OUTPUT_FILE = "finds.txt"
 REPORT_FILE = "report.md"
 TRIED_FILE = "seen.txt"
@@ -37,11 +37,10 @@ PHONETIC = {'ph':'f','gh':'g','ch':'k','sh':'x','qu':'kw','ck':'k','wh':'w','th'
 SUFFIXES = ["fy","ly","io","me","us","co","ai","it","tv","up","or","ic","ed","er","el","en","es","ow","ax","ex","on","ar","in","un","im","il","ia","um","ix","ux","ox","op","ee","oo","ek","id","if","ig","ip","ir","is","ob","od","og","om","os","ot","ov","oy","ub","ud","ug","um","un","up","ur","us","ut","ux","uz"]
 PREFIXES = ["my","go","we","in","up","on","be","do","no","so","hi","ok","he","it","re","un","im","il","ir","co","de","ex","en","em","el","er","es","ed","ly","fy","io","ai","tv","me","us"]
 
-# حروف صامت و مصوت برای ساخت نام‌های تلفظ‌پذیر
 CONSONANTS = "bcdfghjklmnpqrstvwxyz"
 VOWELS = "aeiou"
 
-# ======================= UTILITIES (unchanged except added generator) =======================
+# ======================= UTILITIES =======================
 def load_wordlist():
     try:
         r = requests.get(WORDLIST_URL, timeout=15)
@@ -106,9 +105,7 @@ def variants_from_word(word):
     return list(res)
 
 def gen_pronounceable(tried):
-    """Generate a 5-letter pronounceable username with optional digit."""
     for _ in range(1000):
-        # الگوهای CVCVC یا VCVCV (C=صامت, V=مصوت)
         if random.random() < 0.5:
             pattern = "CVCVC"
         else:
@@ -120,7 +117,7 @@ def gen_pronounceable(tried):
             else:
                 name.append(random.choice(VOWELS))
         cand = ''.join(name)
-        # ۳۰٪ احتمال تزریق عدد در جایگاه غیر اول
+        # ۳۰٪ احتمال تزریق یک عدد (برای تنوع و شانس آزاد بودن)
         if random.random() < 0.3:
             pos = random.randint(1, 4)
             cand = cand[:pos] + random.choice("123456789") + cand[pos+1:]
@@ -179,7 +176,7 @@ def vip_sniper(vips, lock, tried, found, wset, stop):
                 with lock: tried.add(user)
             if st is True:
                 sc = calc_score(user, wset)
-                if sc >= FILTER_LEVEL:
+                if sc >= FILTER_LEVEL:   # با صفر بودن FILTER_LEVEL همه قبول می‌شوند
                     with lock: found.append((user, sc))
                     if sc >= 9.0:
                         try:
@@ -217,13 +214,13 @@ async def main_async():
                                   daemon=True)
     vip_thread.start()
 
-    phase1_end = start + MAX_RUNTIME * 0.3   # فقط ۳۰٪ زمان برای کلمات (چون زود تمام می‌شوند)
+    phase1_end = start + MAX_RUNTIME * 0.2   # فقط ۲۰٪ زمان برای کلمات (سریع تمام می‌شوند)
     consecutive_errors = 0
     stop_early = False
 
     try:
-        # Phase 1: Words & Palindromes
-        print("\n💎 Phase 1: Words & Palindromes...")
+        # Phase 1: Words & Palindromes (همه واریانت‌ها)
+        print("\n💎 Phase 1: Words & Palindromes (all variants)...")
         combined = list(set(dream_words + [w for w in scrabble if w == w[::-1]]))
         random.shuffle(combined)
         batch = []
@@ -246,15 +243,9 @@ async def main_async():
                             consecutive_errors += 1
                         if status is True:
                             sc = calc_score(cand, wset)
-                            if sc >= FILTER_LEVEL:
-                                with lock: found.append((cand, sc))
-                                if sc >= 9.0:
-                                    try:
-                                        requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                                                      json={"chat_id": TG_CHAT_ID, "text": f"💎 WORD: @{cand} ({sc:.1f})",
-                                                            "parse_mode": "Markdown"}, timeout=10)
-                                    except: pass
-                                print(f"✨ WORD/PAL: @{cand} (score {sc:.1f})")
+                            # با آستانه صفر، همهٔ آزادها ذخیره می‌شوند
+                            with lock: found.append((cand, sc))
+                            print(f"✨ WORD/PAL: @{cand} (score {sc:.1f})")
                         elif status is False:
                             print(f"❌ @{cand}")
                         else:
@@ -269,6 +260,7 @@ async def main_async():
                                     f.write(u + "\n")
                     batch.clear()
                     await asyncio.sleep(BATCH_DELAY)
+        # flush remaining batch
         if batch and not stop_early:
             results = await check_bulk(batch)
             for cand, status in results:
@@ -280,9 +272,8 @@ async def main_async():
                     consecutive_errors += 1
                 if status is True:
                     sc = calc_score(cand, wset)
-                    if sc >= FILTER_LEVEL:
-                        with lock: found.append((cand, sc))
-                        print(f"✨ WORD/PAL: @{cand} (score {sc:.1f})")
+                    with lock: found.append((cand, sc))
+                    print(f"✨ WORD/PAL: @{cand} (score {sc:.1f})")
                 elif status is False:
                     print(f"❌ @{cand}")
                 else:
@@ -293,13 +284,15 @@ async def main_async():
                     break
             batch.clear()
 
-        # Phase 2: Pronounceable 5‑char names (rest of time)
+        # Phase 2: Pronounceable 5‑char names (most of the time)
         if not stop_early:
             print("\n🗣️ Phase 2: Pronounceable 5‑char names...")
             while time.time() - start < MAX_RUNTIME and not stop_early:
                 cand = gen_pronounceable(tried)
                 if cand is None:
-                    print("No more pronounceable names to generate.")
+                    # سعی می‌کنیم با الگوهای تصادفی هم پر کنیم
+                    # ولی معمولاً gen_pronounceable تعداد بسیار زیادی نام تولید می‌کند
+                    print("No more pronounceable names generated (unexpected).")
                     break
                 batch.append(cand)
                 if len(batch) >= BATCH_SIZE:
@@ -313,15 +306,14 @@ async def main_async():
                             consecutive_errors += 1
                         if status is True:
                             sc = calc_score(cand, wset)
-                            if sc >= FILTER_LEVEL:
-                                with lock: found.append((cand, sc))
-                                if sc >= 9.0:
-                                    try:
-                                        requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                                                      json={"chat_id": TG_CHAT_ID, "text": f"💎 PRON: @{cand} ({sc:.1f})",
-                                                            "parse_mode": "Markdown"}, timeout=10)
-                                    except: pass
-                                print(f"🗣️ PRON: @{cand} (score {sc:.1f})")
+                            with lock: found.append((cand, sc))
+                            if sc >= 9.0:
+                                try:
+                                    requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                                                  json={"chat_id": TG_CHAT_ID, "text": f"💎 PRON: @{cand} ({sc:.1f})",
+                                                        "parse_mode": "Markdown"}, timeout=10)
+                                except: pass
+                            print(f"🗣️ PRON: @{cand} (score {sc:.1f})")
                         elif status is False:
                             print(f"❌ @{cand}")
                         else:
@@ -341,7 +333,7 @@ async def main_async():
         stop_event.set()
         vip_thread.join(timeout=5)
 
-    # Save results
+    # ذخیره نتایج
     with open(TRIED_FILE, "w") as f:
         for u in tried:
             f.write(u + "\n")
