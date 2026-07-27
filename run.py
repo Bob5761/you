@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Ultimate Telegram Username Scanner – accepts ALL free 5‑char usernames,
-sorts them by beauty score, intelligent pronouncable generation.
+sorts them by beauty score, intelligent pronounceable generation.
 """
 
 import asyncio
@@ -18,7 +18,7 @@ MAX_RUNTIME = 2 * 3600
 BATCH_SIZE = 50
 BATCH_DELAY = 0.1
 MAX_CONSECUTIVE_ERRORS = 20
-FILTER_LEVEL = 0.0            # <-- هر ۵ رقمی آزاد قبول شود
+FILTER_LEVEL = 0.0            # هر ۵ رقمی آزاد قبول شود
 FILTER_LEVEL_6 = 7.0          # برای ۶ رقمی همچنان آستانه بالا
 OUTPUT_FILE = "finds.txt"
 REPORT_FILE = "report.md"
@@ -39,6 +39,14 @@ PREFIXES = ["my","go","we","in","up","on","be","do","no","so","hi","ok","he","it
 
 CONSONANTS = "bcdfghjklmnpqrstvwxyz"
 VOWELS = "aeiou"
+
+VIP_TARGETS = [
+    "queen","king","magic","dream","sword","power","blade","ghost","storm","crown",
+    "angel","money","ethos","pixel","cyber","crypt","vault","brave","flare","glide",
+    "flame","shine","ocean","royal","noble","valor","spark","vivid","zesty","lunar",
+    "prime","frost","crisp","brisk","plush","swift","quest","haven","charm","grace",
+    "bliss","unity","zonal","vapor","zenith","elite","gloom","mirth","glyph","nymph"
+]
 
 # ======================= UTILITIES =======================
 def load_wordlist():
@@ -117,7 +125,6 @@ def gen_pronounceable(tried):
             else:
                 name.append(random.choice(VOWELS))
         cand = ''.join(name)
-        # ۳۰٪ احتمال تزریق یک عدد (برای تنوع و شانس آزاد بودن)
         if random.random() < 0.3:
             pos = random.randint(1, 4)
             cand = cand[:pos] + random.choice("123456789") + cand[pos+1:]
@@ -176,7 +183,7 @@ def vip_sniper(vips, lock, tried, found, wset, stop):
                 with lock: tried.add(user)
             if st is True:
                 sc = calc_score(user, wset)
-                if sc >= FILTER_LEVEL:   # با صفر بودن FILTER_LEVEL همه قبول می‌شوند
+                if sc >= FILTER_LEVEL:
                     with lock: found.append((user, sc))
                     if sc >= 9.0:
                         try:
@@ -214,12 +221,12 @@ async def main_async():
                                   daemon=True)
     vip_thread.start()
 
-    phase1_end = start + MAX_RUNTIME * 0.2   # فقط ۲۰٪ زمان برای کلمات (سریع تمام می‌شوند)
+    phase1_end = start + MAX_RUNTIME * 0.2
     consecutive_errors = 0
     stop_early = False
 
     try:
-        # Phase 1: Words & Palindromes (همه واریانت‌ها)
+        # Phase 1: Words & Palindromes
         print("\n💎 Phase 1: Words & Palindromes (all variants)...")
         combined = list(set(dream_words + [w for w in scrabble if w == w[::-1]]))
         random.shuffle(combined)
@@ -243,7 +250,6 @@ async def main_async():
                             consecutive_errors += 1
                         if status is True:
                             sc = calc_score(cand, wset)
-                            # با آستانه صفر، همهٔ آزادها ذخیره می‌شوند
                             with lock: found.append((cand, sc))
                             print(f"✨ WORD/PAL: @{cand} (score {sc:.1f})")
                         elif status is False:
@@ -260,7 +266,6 @@ async def main_async():
                                     f.write(u + "\n")
                     batch.clear()
                     await asyncio.sleep(BATCH_DELAY)
-        # flush remaining batch
         if batch and not stop_early:
             results = await check_bulk(batch)
             for cand, status in results:
@@ -284,14 +289,12 @@ async def main_async():
                     break
             batch.clear()
 
-        # Phase 2: Pronounceable 5‑char names (most of the time)
+        # Phase 2: Pronounceable 5‑char names
         if not stop_early:
             print("\n🗣️ Phase 2: Pronounceable 5‑char names...")
             while time.time() - start < MAX_RUNTIME and not stop_early:
                 cand = gen_pronounceable(tried)
                 if cand is None:
-                    # سعی می‌کنیم با الگوهای تصادفی هم پر کنیم
-                    # ولی معمولاً gen_pronounceable تعداد بسیار زیادی نام تولید می‌کند
                     print("No more pronounceable names generated (unexpected).")
                     break
                 batch.append(cand)
@@ -333,7 +336,6 @@ async def main_async():
         stop_event.set()
         vip_thread.join(timeout=5)
 
-    # ذخیره نتایج
     with open(TRIED_FILE, "w") as f:
         for u in tried:
             f.write(u + "\n")
