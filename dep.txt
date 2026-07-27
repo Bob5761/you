@@ -1,2 +1,2 @@
-requests
-dnspython
+aiohttp
+requests   # فقط برای دانلود لیست کلمات و نوتیفیکیشن (در آینده می‌توان حذف کرد)
