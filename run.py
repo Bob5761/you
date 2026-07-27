@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Ultimate Telegram Username Scanner – Turbo (Async + HEAD requests).
-Prioritizes real words, then brand atoms, then 6‑char usernames.
+Ultimate Telegram Username Scanner – Turbo (Async + HEAD requests)
+Stops after 20 consecutive network errors to avoid wasting time.
 """
 
 import asyncio
@@ -11,11 +11,13 @@ import time
 import os
 import sys
 import threading
+import requests   # for VIP sniper and wordlist download
 
 # ======================= CONFIG =======================
 MAX_RUNTIME = 2 * 3600          # 2 hours
 BATCH_SIZE = 50                 # concurrent checks
-BATCH_DELAY = 0.1               # short pause between batches
+BATCH_DELAY = 0.1               # pause between batches
+MAX_CONSECUTIVE_ERRORS = 20     # stop if this many errors in a row
 FILTER_LEVEL = 6.0
 FILTER_LEVEL_6 = 7.0
 OUTPUT_FILE = "finds.txt"
@@ -67,7 +69,6 @@ VIP_TARGETS = [
 # ======================= UTILITIES =======================
 def load_wordlist():
     try:
-        import requests
         r = requests.get(WORDLIST_URL, timeout=15)
         if r.status_code == 200:
             return [w.strip().lower() for w in r.text.splitlines() if len(w.strip()) == 5]
@@ -172,11 +173,11 @@ async def check_one(session, username):
     try:
         async with session.head(url, headers=headers, timeout=5) as resp:
             if resp.status == 200:
-                return False   # taken
+                return False
             elif resp.status == 404:
-                return True    # free
+                return True
             else:
-                # fallback to GET for certainty
+                # fallback to GET
                 async with session.get(url, headers=headers, timeout=5) as get_resp:
                     if get_resp.status == 200:
                         return False
@@ -185,24 +186,15 @@ async def check_one(session, username):
     except:
         return None
 
-# ======================= VIP SNIPER (ASYNC) =======================
+# ======================= VIP SNIPER =======================
 def vip_sniper(vips, lock, tried, found, wset, stop):
-    async def _sniper_loop():
-        while not stop.is_set():
-            random.shuffle(vips)
-            for user in vips:
-                if stop.is_set(): break
-                if user in tried: continue
-                st = await check_one(None, user)   # will create session internally in check_bulk, but here we need to adapt; for simplicity we run check_bulk with one name
-                # better: use check_bulk once
-    # For simplicity, we'll keep the old sync VIP sniper for now (rarely used), but we can implement later.
-    # Actually just run it in a separate thread with requests (old version). It's just 50 names.
-    import requests
+    """Runs in a separate thread, uses synchronous requests for simplicity."""
     while not stop.is_set():
         random.shuffle(vips)
         for user in vips:
             if stop.is_set(): break
             if user in tried: continue
+            st = None
             try:
                 r = requests.head(f"https://t.me/{user}", headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
                 if r.status_code == 200:
@@ -250,11 +242,16 @@ async def main_async():
     lock = threading.Lock()
     found = []
     chk = 0
-    stop = threading.Event()
-    vip_thread = threading.Thread(target=vip_sniper, args=(VIP_TARGETS, lock, tried, found, wset, stop), daemon=True)
+    stop_event = threading.Event()
+    vip_thread = threading.Thread(target=vip_sniper,
+                                  args=(VIP_TARGETS, lock, tried, found, wset, stop_event),
+                                  daemon=True)
     vip_thread.start()
 
     phase1_end = start + MAX_RUNTIME * 0.8
+    consecutive_errors = 0
+    stop_early = False
+
     try:
         # Phase 1: Words & Palindromes (80% time)
         print("\n💎 Phase 1: Words & Palindromes...")
@@ -262,8 +259,11 @@ async def main_async():
         random.shuffle(combined)
         batch = []
         for w in combined:
-            if time.time() - start > phase1_end: break
+            if time.time() - start > phase1_end or stop_early:
+                break
             for cand in variants_from_word(w):
+                if time.time() - start > phase1_end or stop_early:
+                    break
                 if cand in tried: continue
                 batch.append(cand)
                 if len(batch) >= BATCH_SIZE:
@@ -272,14 +272,16 @@ async def main_async():
                         chk += 1
                         if status is not None:
                             with lock: tried.add(cand)
+                            consecutive_errors = 0
+                        else:
+                            consecutive_errors += 1
                         if status is True:
                             sc = calc_score(cand, wset)
                             if sc >= FILTER_LEVEL:
                                 with lock: found.append((cand, sc))
                                 if sc >= 9.0:
                                     try:
-                                        import requests as req_sync
-                                        req_sync.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                                        requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
                                                       json={"chat_id": TG_CHAT_ID, "text": f"💎 WORD: @{cand} ({sc:.1f})",
                                                             "parse_mode": "Markdown"}, timeout=10)
                                     except: pass
@@ -288,18 +290,25 @@ async def main_async():
                             print(f"❌ @{cand}")
                         else:
                             print(f"⚠️ @{cand}")
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                            print("❌ Too many consecutive errors, stopping.")
+                            stop_early = True
+                            break
                         if chk % 100 == 0:
                             with open(TRIED_FILE, "a") as f:
-                                for u in list(tried)[-100:]: f.write(u + "\n")
+                                for u in list(tried)[-100:]:
+                                    f.write(u + "\n")
                     batch.clear()
                     await asyncio.sleep(BATCH_DELAY)
-        # flush remaining
-        if batch:
+        if batch and not stop_early:
             results = await check_bulk(batch)
             for cand, status in results:
                 chk += 1
                 if status is not None:
                     with lock: tried.add(cand)
+                    consecutive_errors = 0
+                else:
+                    consecutive_errors += 1
                 if status is True:
                     sc = calc_score(cand, wset)
                     if sc >= FILTER_LEVEL:
@@ -309,87 +318,111 @@ async def main_async():
                     print(f"❌ @{cand}")
                 else:
                     print(f"⚠️ @{cand}")
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    print("❌ Too many consecutive errors, stopping.")
+                    stop_early = True
+                    break
             batch.clear()
 
         # Phase 2: Brand Atoms (until 95% of runtime)
-        print("\n⚛️ Phase 2: Brand Atoms...")
-        while time.time() - start < MAX_RUNTIME * 0.95:
-            cand = gen_atom(tried)
-            if cand is None:
-                print("No more atoms.")
-                break
-            batch.append(cand)
-            if len(batch) >= BATCH_SIZE:
-                results = await check_bulk(batch)
-                for cand, status in results:
-                    chk += 1
-                    if status is not None:
-                        with lock: tried.add(cand)
-                    if status is True:
-                        sc = calc_score(cand, wset)
-                        if sc >= FILTER_LEVEL:
-                            with lock: found.append((cand, sc))
-                            if sc >= 9.0:
-                                try:
-                                    import requests as req_sync
-                                    req_sync.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                                                  json={"chat_id": TG_CHAT_ID, "text": f"💎 ATOM: @{cand} ({sc:.1f})",
-                                                        "parse_mode": "Markdown"}, timeout=10)
-                                except: pass
-                            print(f"⚛️ ATOM: @{cand} (score {sc:.1f})")
-                    elif status is False:
-                        print(f"❌ @{cand}")
-                    else:
-                        print(f"⚠️ @{cand}")
-                    if chk % 100 == 0:
-                        with open(TRIED_FILE, "a") as f:
-                            for u in list(tried)[-100:]: f.write(u + "\n")
-                batch.clear()
-                await asyncio.sleep(BATCH_DELAY)
+        if not stop_early:
+            print("\n⚛️ Phase 2: Brand Atoms...")
+            while time.time() - start < MAX_RUNTIME * 0.95 and not stop_early:
+                cand = gen_atom(tried)
+                if cand is None:
+                    print("No more atoms.")
+                    break
+                batch.append(cand)
+                if len(batch) >= BATCH_SIZE:
+                    results = await check_bulk(batch)
+                    for cand, status in results:
+                        chk += 1
+                        if status is not None:
+                            with lock: tried.add(cand)
+                            consecutive_errors = 0
+                        else:
+                            consecutive_errors += 1
+                        if status is True:
+                            sc = calc_score(cand, wset)
+                            if sc >= FILTER_LEVEL:
+                                with lock: found.append((cand, sc))
+                                if sc >= 9.0:
+                                    try:
+                                        requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                                                      json={"chat_id": TG_CHAT_ID, "text": f"💎 ATOM: @{cand} ({sc:.1f})",
+                                                            "parse_mode": "Markdown"}, timeout=10)
+                                    except: pass
+                                print(f"⚛️ ATOM: @{cand} (score {sc:.1f})")
+                        elif status is False:
+                            print(f"❌ @{cand}")
+                        else:
+                            print(f"⚠️ @{cand}")
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                            print("❌ Too many consecutive errors, stopping.")
+                            stop_early = True
+                            break
+                        if chk % 100 == 0:
+                            with open(TRIED_FILE, "a") as f:
+                                for u in list(tried)[-100:]:
+                                    f.write(u + "\n")
+                    batch.clear()
+                    await asyncio.sleep(BATCH_DELAY)
 
         # Phase 3: 6‑char (remaining time)
-        print("\n🔢 Phase 3: 6-char usernames...")
-        while time.time() - start < MAX_RUNTIME:
-            cand = gen_6char(tried)
-            if cand is None: break
-            batch.append(cand)
-            if len(batch) >= BATCH_SIZE:
-                results = await check_bulk(batch)
-                for cand, status in results:
-                    chk += 1
-                    if status is not None:
-                        with lock: tried.add(cand)
-                    if status is True:
-                        sc = calc_score(cand, wset)
-                        if sc >= FILTER_LEVEL_6:
-                            with lock: found.append((cand, sc))
-                            if sc >= 8.5:
-                                try:
-                                    import requests as req_sync
-                                    req_sync.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                                                  json={"chat_id": TG_CHAT_ID, "text": f"💎 6CHAR: @{cand} ({sc:.1f})",
-                                                        "parse_mode": "Markdown"}, timeout=10)
-                                except: pass
-                            print(f"🔢 6CHAR: @{cand} (score {sc:.1f})")
-                    elif status is False:
-                        print(f"❌ @{cand}")
-                    else:
-                        print(f"⚠️ @{cand}")
-                    if chk % 100 == 0:
-                        with open(TRIED_FILE, "a") as f:
-                            for u in list(tried)[-100:]: f.write(u + "\n")
-                batch.clear()
-                await asyncio.sleep(BATCH_DELAY)
+        if not stop_early:
+            print("\n🔢 Phase 3: 6-char usernames...")
+            while time.time() - start < MAX_RUNTIME and not stop_early:
+                cand = gen_6char(tried)
+                if cand is None:
+                    break
+                batch.append(cand)
+                if len(batch) >= BATCH_SIZE:
+                    results = await check_bulk(batch)
+                    for cand, status in results:
+                        chk += 1
+                        if status is not None:
+                            with lock: tried.add(cand)
+                            consecutive_errors = 0
+                        else:
+                            consecutive_errors += 1
+                        if status is True:
+                            sc = calc_score(cand, wset)
+                            if sc >= FILTER_LEVEL_6:
+                                with lock: found.append((cand, sc))
+                                if sc >= 8.5:
+                                    try:
+                                        requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                                                      json={"chat_id": TG_CHAT_ID, "text": f"💎 6CHAR: @{cand} ({sc:.1f})",
+                                                            "parse_mode": "Markdown"}, timeout=10)
+                                    except: pass
+                                print(f"🔢 6CHAR: @{cand} (score {sc:.1f})")
+                        elif status is False:
+                            print(f"❌ @{cand}")
+                        else:
+                            print(f"⚠️ @{cand}")
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                            print("❌ Too many consecutive errors, stopping.")
+                            stop_early = True
+                            break
+                        if chk % 100 == 0:
+                            with open(TRIED_FILE, "a") as f:
+                                for u in list(tried)[-100:]:
+                                    f.write(u + "\n")
+                    batch.clear()
+                    await asyncio.sleep(BATCH_DELAY)
 
     finally:
-        stop.set()
+        stop_event.set()
         vip_thread.join(timeout=5)
 
+    # Save everything
     with open(TRIED_FILE, "w") as f:
-        for u in tried: f.write(u + "\n")
+        for u in tried:
+            f.write(u + "\n")
     found.sort(key=lambda x: x[1], reverse=True)
     with open(OUTPUT_FILE, "w") as f:
-        for n, s in found: f.write(f"{n} (score {s:.1f})\n")
+        for n, s in found:
+            f.write(f"{n} (score {s:.1f})\n")
     with open(REPORT_FILE, "w") as f:
         f.write("# Report\n")
         f.write(f"**Found:** {len(found)}\n\n")
