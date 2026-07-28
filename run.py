@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Ultimate Telegram Username Scanner – accepts ALL free 5‑char usernames,
-sorts them by beauty score, intelligent pronounceable generation.
+Telegram Username Scanner – DoH (DNS‑over‑HTTPS) edition.
+Bypasses Telegram's web server completely.
+Stops after 30 minutes.
 """
 
 import asyncio
@@ -11,15 +12,15 @@ import time
 import os
 import sys
 import threading
-import requests
+import json
 
 # ======================= CONFIG =======================
-MAX_RUNTIME = 2 * 3600
-BATCH_SIZE = 50
-BATCH_DELAY = 0.1
-MAX_CONSECUTIVE_ERRORS = 20
-FILTER_LEVEL = 0.0            # هر ۵ رقمی آزاد قبول شود
-FILTER_LEVEL_6 = 7.0          # برای ۶ رقمی همچنان آستانه بالا
+MAX_RUNTIME = 0.5 * 3600      # 30 minutes
+BATCH_SIZE = 20               # reduced for DoH rate limits
+BATCH_DELAY = 2.0             # pause between batches (seconds)
+MAX_CONSECUTIVE_ERRORS = 10   # stop if this many DoH errors in a row
+FILTER_LEVEL = 0.0            # accept every free 5‑char name
+FILTER_LEVEL_6 = 7.0
 OUTPUT_FILE = "finds.txt"
 REPORT_FILE = "report.md"
 TRIED_FILE = "seen.txt"
@@ -28,7 +29,18 @@ VIP_CHECK_INTERVAL = 300
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
-WORDLIST_URL = "https://raw.githubusercontent.com/charlesreid1/five-letter-words/master/sgb-words.txt"
+# DoH endpoints (rotated randomly)
+DOH_ENDPOINTS = [
+    "https://dns.google/resolve",
+    "https://cloudflare-dns.com/dns-query",
+    "https://dns.quad9.net:5053/dns-query",   # Quad9 may need custom handling, but we'll use only Google/Cloudflare for reliability
+    "https://dns.google/resolve",             # extra Google entry for load balancing
+]
+# Actually Quad9 uses /dns-query? We'll stick to Google and Cloudflare to avoid issues.
+DOH_ENDPOINTS = [
+    "https://dns.google/resolve",
+    "https://cloudflare-dns.com/dns-query",
+]
 
 # ======================= STATIC DATA =======================
 LEET = {'a':'4','e':'3','i':'1','o':'0','s':'5','t':'7','l':'1','b':'8','z':'2','g':'6'}
@@ -50,8 +62,10 @@ VIP_TARGETS = [
 
 # ======================= UTILITIES =======================
 def load_wordlist():
+    """Download the 5‑letter Scrabble word list."""
+    import requests as req_sync   # used only once at startup
     try:
-        r = requests.get(WORDLIST_URL, timeout=15)
+        r = req_sync.get("https://raw.githubusercontent.com/charlesreid1/five-letter-words/master/sgb-words.txt", timeout=15)
         if r.status_code == 200:
             return [w.strip().lower() for w in r.text.splitlines() if len(w.strip()) == 5]
     except:
@@ -132,76 +146,99 @@ def gen_pronounceable(tried):
             return cand
     return None
 
-def gen_6char(tried):
-    for _ in range(1000):
-        if random.random() < 0.5:
-            letters = ''.join(random.choices("abcdefghijklmnopqrstuvwxyz", k=4))
-            digits = ''.join(random.choices("0123456789", k=2))
-            cand = letters + digits
-        else:
-            letters = ''.join(random.choices("abcdefghijklmnopqrstuvwxyz", k=5))
-            digit = random.choice("0123456789")
-            pos = random.randint(0,5)
-            cand = letters[:pos] + digit + letters[pos:]
-        if len(cand) == 6 and cand not in tried: return cand
+# ======================= DoH CHECKER =======================
+async def doh_check(session, username, endpoint):
+    """Query DNS via DoH. Returns True if NXDOMAIN (free), False if resolved (taken), None on error."""
+    params = {"name": f"{username}.t.me", "type": "A"}
+    headers = {"Accept": "application/dns-json"}
+    try:
+        async with session.get(endpoint, params=params, headers=headers, timeout=5) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            status = data.get("Status", -1)
+            if status == 3:   # NXDOMAIN
+                return True
+            elif status == 0 and "Answer" in data:
+                return False   # resolved -> taken
+            # any other status (SERVFAIL, REFUSED) -> fallback to next endpoint
+            return None
+    except:
+        return None
+
+async def check_one(session, username):
+    """Try several DoH endpoints; return True/False/None."""
+    # shuffle endpoints to distribute load
+    endpoints = random.sample(DOH_ENDPOINTS, len(DOH_ENDPOINTS))
+    for ep in endpoints:
+        res = await doh_check(session, username, ep)
+        if res is not None:
+            return res
     return None
 
-# ======================= ASYNC CHECKER =======================
 async def check_bulk(usernames):
     async with aiohttp.ClientSession() as session:
         tasks = [check_one(session, u) for u in usernames]
         results = await asyncio.gather(*tasks)
     return list(zip(usernames, results))
 
-async def check_one(session, username):
-    url = f"https://t.me/{username}"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        async with session.get(url, headers=headers, timeout=5) as resp:
-            text = await resp.text()
-            if "doesn't exist" in text.lower():
-                return True
-            else:
-                return False
-    except:
-        return None
+# ======================= SANITY CHECK =======================
+async def sanity_check():
+    """Return True if DoH is working correctly."""
+    known_free = "abcdefg12345678"   # almost certainly free
+    known_taken = "telegram"         # definitely taken
+    async with aiohttp.ClientSession() as session:
+        free_result = await check_one(session, known_free)
+        taken_result = await check_one(session, known_taken)
+        if free_result is True and taken_result is False:
+            print("✅ Sanity check passed: DoH is working correctly.")
+            return True
+        else:
+            print("❌ Sanity check FAILED: DoH returned unexpected results.")
+            print(f"   Free test ({known_free}): {free_result}")
+            print(f"   Taken test ({known_taken}): {taken_result}")
+            return False
 
-# ======================= VIP SNIPER =======================
+# ======================= VIP SNIPER (uses same DoH) =======================
 def vip_sniper(vips, lock, tried, found, wset, stop):
-    while not stop.is_set():
-        random.shuffle(vips)
-        for user in vips:
-            if stop.is_set(): break
-            if user in tried: continue
-            st = None
-            try:
-                r = requests.get(f"https://t.me/{user}", headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-                st = ("doesn't exist" in r.text.lower())
-            except:
-                st = None
-            if st is not None:
-                with lock: tried.add(user)
-            if st is True:
-                sc = calc_score(user, wset)
-                if sc >= FILTER_LEVEL:
+    async def _vip_loop():
+        while not stop.is_set():
+            random.shuffle(vips)
+            for user in vips:
+                if stop.is_set(): break
+                if user in tried: continue
+                async with aiohttp.ClientSession() as session:
+                    st = await check_one(session, user)
+                if st is not None:
+                    with lock: tried.add(user)
+                if st is True:
+                    sc = calc_score(user, wset)
                     with lock: found.append((user, sc))
                     if sc >= 9.0:
                         try:
-                            requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                            import requests as req_sync
+                            req_sync.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
                                           json={"chat_id": TG_CHAT_ID, "text": f"💎 VIP: @{user} ({sc:.1f})",
                                                 "parse_mode": "Markdown"}, timeout=10)
                         except: pass
                     print(f"🎯 VIP SNIPE: @{user} (score {sc:.1f})")
-            elif st is False:
-                print(f"🔒 VIP: @{user}")
-            else:
-                print(f"⚠️ VIP check error: @{user}")
-            time.sleep(random.uniform(0.3, 0.6))
-        time.sleep(VIP_CHECK_INTERVAL)
+                elif st is False:
+                    print(f"🔒 VIP: @{user}")
+                else:
+                    print(f"⚠️ VIP check error: @{user}")
+                time.sleep(random.uniform(0.3, 0.6))
+            await asyncio.sleep(VIP_CHECK_INTERVAL)
+    asyncio.run(_vip_loop())
 
 # ======================= MAIN =======================
 async def main_async():
     start = time.time()
+
+    # Sanity check first
+    if not await sanity_check():
+        print("Aborting.")
+        sys.exit(1)
+
     scrabble = load_wordlist()
     dream_words = list(set(scrabble + VIP_TARGETS))
     wset = set(scrabble)
@@ -257,7 +294,7 @@ async def main_async():
                         else:
                             print(f"⚠️ @{cand}")
                         if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                            print("❌ Too many consecutive errors, stopping.")
+                            print("❌ Too many consecutive DoH errors, stopping.")
                             stop_early = True
                             break
                         if chk % 100 == 0:
@@ -284,18 +321,18 @@ async def main_async():
                 else:
                     print(f"⚠️ @{cand}")
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                    print("❌ Too many consecutive errors, stopping.")
+                    print("❌ Too many consecutive DoH errors, stopping.")
                     stop_early = True
                     break
             batch.clear()
 
         # Phase 2: Pronounceable 5‑char names
         if not stop_early:
-            print("\n🗣️ Phase 2: Pronounceable 5‑char names...")
+            print("\n🗣️ Phase 2: Pronounceable 5‑char names (DoH)...")
             while time.time() - start < MAX_RUNTIME and not stop_early:
                 cand = gen_pronounceable(tried)
                 if cand is None:
-                    print("No more pronounceable names generated (unexpected).")
+                    print("Generator exhausted (should not happen).")
                     break
                 batch.append(cand)
                 if len(batch) >= BATCH_SIZE:
@@ -312,7 +349,8 @@ async def main_async():
                             with lock: found.append((cand, sc))
                             if sc >= 9.0:
                                 try:
-                                    requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                                    import requests as req_sync
+                                    req_sync.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
                                                   json={"chat_id": TG_CHAT_ID, "text": f"💎 PRON: @{cand} ({sc:.1f})",
                                                         "parse_mode": "Markdown"}, timeout=10)
                                 except: pass
@@ -322,7 +360,7 @@ async def main_async():
                         else:
                             print(f"⚠️ @{cand}")
                         if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                            print("❌ Too many consecutive errors, stopping.")
+                            print("❌ Too many consecutive DoH errors, stopping.")
                             stop_early = True
                             break
                         if chk % 100 == 0:
