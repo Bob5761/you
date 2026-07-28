@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
 """
-Telegram Username Scanner – HTTP with rotating proxies.
-Bypasses GitHub IP ban. 30‑minute runs.
+Telegram Username Scanner – Max Turbo (HTTP/2, high concurrency, IP‑pinned)
+Pre‑check with 5 random 7‑char usernames.
 """
 
 import asyncio
 import aiohttp
 import random
+import socket
 import time
 import os
 import sys
 import threading
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ======================= CONFIG =======================
 MAX_RUNTIME = 0.5 * 3600      # 30 minutes
-BATCH_SIZE = 30               # concurrent checks
-BATCH_DELAY = 2.0             # seconds between batches
-MAX_CONSECUTIVE_ERRORS = 5
+BATCH_SIZE = 500              # enormous concurrency
+BATCH_DELAY = 0.01            # minimal pause
 FILTER_LEVEL = 0.0
 FILTER_LEVEL_6 = 7.0
 OUTPUT_FILE = "finds.txt"
@@ -48,6 +47,31 @@ VIP_TARGETS = [
     "prime","frost","crisp","brisk","plush","swift","quest","haven","charm","grace",
     "bliss","unity","zonal","vapor","zenith","elite","gloom","mirth","glyph","nymph"
 ]
+
+# ======================= CUSTOM RESOLVER =======================
+class StaticResolver(aiohttp.abc.AbstractResolver):
+    def __init__(self, host_to_ips):
+        self._host_to_ips = host_to_ips
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        ips = self._host_to_ips.get(host)
+        if ips:
+            ip = random.choice(ips)
+            return [{'host': ip, 'port': port, 'family': family, 'proto': 0, 'flags': socket.AI_NUMERICHOST}]
+        # fallback (should not happen)
+        infos = await self._real_resolve(host, port, family)
+        return [{'host': info[4][0], 'port': port, 'family': family, 'proto': 0, 'flags': socket.AI_NUMERICHOST} for info in infos]
+    async def close(self):
+        pass
+
+def get_tme_ips():
+    ips = set()
+    try:
+        for info in socket.getaddrinfo('t.me', 443, socket.AF_INET, socket.SOCK_STREAM):
+            ips.add(info[4][0])
+    except:
+        pass
+    ips.update(['149.154.167.99', '149.154.175.100', '149.154.167.91'])
+    return list(ips)
 
 # ======================= UTILITIES =======================
 def load_wordlist():
@@ -133,209 +157,217 @@ def gen_pronounceable(tried):
             return cand
     return None
 
-# ======================= PROXY HANDLING =======================
-PROXY_URLS = [
-    "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
-    "https://www.proxy-list.download/api/v1/get?type=http",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-]
+def gen_random_7char():
+    chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+    return ''.join(random.choices(chars, k=7))
 
-def fetch_proxies():
-    proxies = []
-    for url in PROXY_URLS:
-        try:
-            r = requests.get(url, timeout=8)
-            if r.status_code == 200:
-                proxies.extend([line.strip() for line in r.text.splitlines() if line.strip()])
-        except:
-            pass
-    return list(set(proxies))
-
-def test_proxy(p):
-    try:
-        r = requests.get("https://t.me/telegram", proxies={"http": f"http://{p}", "https": f"http://{p}"}, timeout=4)
-        return r.status_code == 200 and "telegram" in r.text.lower()
-    except:
-        return False
-
-def get_working_proxies(min_count=20):
-    proxies = fetch_proxies()
-    if not proxies:
-        return []
-    good = []
-    with ThreadPoolExecutor(max_workers=30) as ex:
-        futures = {ex.submit(test_proxy, p): p for p in proxies[:100]}
-        for f in as_completed(futures):
-            p = futures[f]
-            if f.result():
-                good.append(p)
-                if len(good) >= min_count:
-                    break
-    return good
-
-# ======================= HTTP CHECK WITH PROXY =======================
-async def check_one(session, username, proxy_addr):
+# ======================= FAST CHECKER =======================
+async def check_one(session, username):
     url = f"https://t.me/{username}"
     headers = {"User-Agent": "Mozilla/5.0"}
-    proxy = f"http://{proxy_addr}"
     try:
-        async with session.get(url, headers=headers, proxy=proxy, timeout=8) as resp:
-            text = await resp.text()
-            if "doesn't exist" in text.lower():
+        async with session.head(url, headers=headers, timeout=3, allow_redirects=False) as resp:
+            if resp.status == 404:
                 return True
-            return False
+            elif resp.status == 200:
+                return False
+            else:
+                async with session.get(url, headers=headers, timeout=3, allow_redirects=False) as get_resp:
+                    if get_resp.status == 404:
+                        return True
+                    elif get_resp.status == 200:
+                        return False
+                    else:
+                        return None
     except:
         return None
 
-async def check_bulk(usernames, proxy_list):
-    """Check a batch using random proxies from the given list."""
-    async with aiohttp.ClientSession() as session:
-        tasks = []
-        for u in usernames:
-            if not proxy_list:
-                # no proxies left? skip
-                tasks.append(asyncio.sleep(0, result=None))
-                continue
-            p = random.choice(proxy_list)
-            tasks.append(check_one(session, u, p))
-        results = await asyncio.gather(*tasks)
+async def check_bulk(usernames, session):
+    tasks = [check_one(session, u) for u in usernames]
+    results = await asyncio.gather(*tasks)
     return list(zip(usernames, results))
 
-# ======================= SANITY CHECK (direct IP) =======================
-async def sanity_check():
-    """Check if direct IP is banned. We assume it is."""
-    # We just verify that we have proxies
-    proxies = get_working_proxies(min_count=10)
-    if len(proxies) < 5:
-        print("❌ Not enough working proxies. Aborting.")
+# ======================= SANITY CHECK =======================
+async def sanity_check(session):
+    known_free = "abcdefg12345678"
+    known_taken = "telegram"
+    free_result, taken_result = await asyncio.gather(check_one(session, known_free), check_one(session, known_taken))
+    if free_result is True and taken_result is False:
+        print("✅ Sanity check passed. Scanner ready.")
+        return True
+    else:
+        print(f"❌ Sanity check FAILED. Free={free_result}, Taken={taken_result}")
         return False
-    print(f"✅ {len(proxies)} proxies ready.")
-    return True
+
+# ======================= VIP SNIPER =======================
+def vip_sniper(vips, lock, tried, found, wset, stop):
+    import requests as req_sync
+    while not stop.is_set():
+        random.shuffle(vips)
+        for user in vips:
+            if stop.is_set(): break
+            if user in tried: continue
+            st = None
+            try:
+                r = req_sync.head(f"https://t.me/{user}", headers={"User-Agent": "Mozilla/5.0"}, timeout=3)
+                if r.status_code == 404:
+                    st = True
+                elif r.status_code == 200:
+                    st = False
+                else:
+                    r2 = req_sync.get(f"https://t.me/{user}", headers={"User-Agent": "Mozilla/5.0"}, timeout=3)
+                    st = ("doesn't exist" in r2.text.lower())
+            except:
+                st = None
+            if st is not None:
+                with lock: tried.add(user)
+            if st is True:
+                sc = calc_score(user, wset)
+                with lock: found.append((user, sc))
+                print(f"🎯 VIP SNIPE: @{user} (score {sc:.1f})")
+            elif st is False:
+                print(f"🔒 VIP: @{user}")
+            else:
+                print(f"⚠️ VIP check error: @{user}")
+            time.sleep(random.uniform(0.2, 0.4))
+        time.sleep(VIP_CHECK_INTERVAL)
 
 # ======================= MAIN =======================
 async def main_async():
     start = time.time()
 
-    if not await sanity_check():
-        sys.exit(1)
+    tme_ips = get_tme_ips()
+    print(f"🌐 Pre‑resolved {len(tme_ips)} IPs for t.me")
 
-    scrabble = load_wordlist()
-    dream_words = list(set(scrabble + VIP_TARGETS))
-    wset = set(scrabble)
-    print(f"📚 Seed words: {len(dream_words)}")
+    # Use a massive TCP connector with high concurrency
+    connector = aiohttp.TCPConnector(
+        resolver=StaticResolver({'t.me': tme_ips}),
+        ssl=True,
+        limit=0,          # no limit on concurrent connections
+        limit_per_host=0, # no limit per host
+        ttl_dns_cache=None,
+        use_dns_cache=False,
+        enable_cleanup_closed=False   # performance boost
+    )
 
-    tried = set()
-    if os.path.exists(TRIED_FILE):
-        with open(TRIED_FILE) as f:
-            tried = set(line.strip() for line in f)
+    # Try HTTP/2 by setting force_protocol? aiohttp automatically uses HTTP/2 if supported.
+    # We'll create a session with the connector.
+    timeout = aiohttp.ClientTimeout(total=5)
 
-    lock = threading.Lock()
-    found = []
-    chk = 0
-    stop_event = threading.Event()
-    # VIP sniper disabled for brevity (can be added later)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        # ── Sanity check (known free/taken) ──
+        if not await sanity_check(session):
+            print("Aborting.")
+            sys.exit(1)
 
-    # Initial proxy pool
-    proxy_pool = get_working_proxies(min_count=20)
+        # ── Pre‑check with 5 random 7‑char usernames ──
+        print("\n🔬 Pre‑check: testing 5 random 7‑char usernames...")
+        random_7 = [gen_random_7char() for _ in range(5)]
+        results_7 = await check_bulk(random_7, session)
+        for name, status in results_7:
+            if status is True:
+                print(f"   ✅ @{name} → FREE (good, scanner works)")
+            elif status is False:
+                print(f"   ❌ @{name} → TAKEN (normal for random strings)")
+            else:
+                print(f"   ⚠️ @{name} → ERROR (may indicate network issue)")
+        print("─" * 40)
 
-    phase1_end = start + MAX_RUNTIME * 0.2
-    consecutive_errors = 0
-    stop_early = False
+        # ── Load words ──
+        scrabble = load_wordlist()
+        dream_words = list(set(scrabble + VIP_TARGETS))
+        wset = set(scrabble)
+        print(f"📚 Seed words: {len(dream_words)}")
 
-    try:
-        # Phase 1: Words & Palindromes
-        print("\n💎 Phase 1: Words & Palindromes (proxied)...")
-        combined = list(set(dream_words + [w for w in scrabble if w == w[::-1]]))
-        random.shuffle(combined)
-        batch = []
-        for w in combined:
-            if time.time() - start > phase1_end or stop_early:
-                break
-            for cand in variants_from_word(w):
+        tried = set()
+        if os.path.exists(TRIED_FILE):
+            with open(TRIED_FILE) as f:
+                tried = set(line.strip() for line in f)
+
+        lock = threading.Lock()
+        found = []
+        chk = 0
+        stop_event = threading.Event()
+        vip_thread = threading.Thread(target=vip_sniper, args=(VIP_TARGETS, lock, tried, found, wset, stop_event), daemon=True)
+        vip_thread.start()
+
+        phase1_end = start + MAX_RUNTIME * 0.2
+        stop_early = False
+
+        try:
+            # Phase 1: Words & Palindromes
+            print("\n💎 Phase 1: Words & Palindromes (Max Turbo)...")
+            combined = list(set(dream_words + [w for w in scrabble if w == w[::-1]]))
+            random.shuffle(combined)
+            batch = []
+            for w in combined:
                 if time.time() - start > phase1_end or stop_early:
                     break
-                if cand in tried: continue
-                batch.append(cand)
-                if len(batch) >= BATCH_SIZE:
-                    results = await check_bulk(batch, proxy_pool)
-                    for cand, status in results:
-                        chk += 1
-                        if status is not None:
-                            with lock: tried.add(cand)
-                            consecutive_errors = 0
-                        else:
-                            consecutive_errors += 1
-                        if status is True:
-                            sc = calc_score(cand, wset)
-                            with lock: found.append((cand, sc))
-                            print(f"✨ WORD/PAL: @{cand} (score {sc:.1f})")
-                        elif status is False:
-                            print(f"❌ @{cand}")
-                        else:
-                            print(f"⚠️ @{cand}")
-                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                            # refresh proxy pool
-                            new_pool = get_working_proxies(min_count=20)
-                            if new_pool:
-                                proxy_pool = new_pool
-                                consecutive_errors = 0
+                for cand in variants_from_word(w):
+                    if time.time() - start > phase1_end or stop_early:
+                        break
+                    if cand in tried: continue
+                    batch.append(cand)
+                    if len(batch) >= BATCH_SIZE:
+                        results = await check_bulk(batch, session)
+                        for cand, status in results:
+                            chk += 1
+                            if status is not None:
+                                with lock: tried.add(cand)
+                            if status is True:
+                                sc = calc_score(cand, wset)
+                                with lock: found.append((cand, sc))
+                                print(f"✨ WORD/PAL: @{cand} (score {sc:.1f})")
+                            elif status is False:
+                                print(f"❌ @{cand}")
                             else:
-                                print("❌ No proxies left, stopping.")
-                                stop_early = True
-                                break
-                        if chk % 100 == 0:
-                            with open(TRIED_FILE, "a") as f:
-                                for u in list(tried)[-100:]:
-                                    f.write(u + "\n")
-                    batch.clear()
-                    await asyncio.sleep(BATCH_DELAY)
-        # Phase 2: Pronounceable
-        if not stop_early:
-            print("\n🗣️ Phase 2: Pronounceable 5‑char names (proxied)...")
-            while time.time() - start < MAX_RUNTIME and not stop_early:
-                cand = gen_pronounceable(tried)
-                if cand is None: break
-                batch.append(cand)
-                if len(batch) >= BATCH_SIZE:
-                    results = await check_bulk(batch, proxy_pool)
-                    for cand, status in results:
-                        chk += 1
-                        if status is not None:
-                            with lock: tried.add(cand)
-                            consecutive_errors = 0
-                        else:
-                            consecutive_errors += 1
-                        if status is True:
-                            sc = calc_score(cand, wset)
-                            with lock: found.append((cand, sc))
-                            if sc >= 9.0:
-                                try:
-                                    requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                                                  json={"chat_id": TG_CHAT_ID, "text": f"💎 PRON: @{cand} ({sc:.1f})",
-                                                        "parse_mode": "Markdown"}, timeout=10)
-                                except: pass
-                            print(f"🗣️ PRON: @{cand} (score {sc:.1f})")
-                        elif status is False:
-                            print(f"❌ @{cand}")
-                        else:
-                            print(f"⚠️ @{cand}")
-                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                            new_pool = get_working_proxies(min_count=20)
-                            if new_pool:
-                                proxy_pool = new_pool
-                                consecutive_errors = 0
-                            else:
-                                stop_early = True
-                                break
-                        if chk % 100 == 0:
-                            with open(TRIED_FILE, "a") as f:
-                                for u in list(tried)[-100:]:
-                                    f.write(u + "\n")
-                    batch.clear()
-                    await asyncio.sleep(BATCH_DELAY)
+                                print(f"⚠️ @{cand}")
+                            if chk % 2000 == 0:
+                                with open(TRIED_FILE, "a") as f:
+                                    for u in list(tried)[-500:]:
+                                        f.write(u + "\n")
+                        batch.clear()
+                        await asyncio.sleep(BATCH_DELAY)
 
-    finally:
-        stop_event.set()
+            # Phase 2: Pronounceable
+            if not stop_early:
+                print("\n🗣️ Phase 2: Pronounceable 5‑char names (Max Turbo)...")
+                while time.time() - start < MAX_RUNTIME and not stop_early:
+                    cand = gen_pronounceable(tried)
+                    if cand is None:
+                        print("Generator exhausted.")
+                        break
+                    batch.append(cand)
+                    if len(batch) >= BATCH_SIZE:
+                        results = await check_bulk(batch, session)
+                        for cand, status in results:
+                            chk += 1
+                            if status is not None:
+                                with lock: tried.add(cand)
+                            if status is True:
+                                sc = calc_score(cand, wset)
+                                with lock: found.append((cand, sc))
+                                if sc >= 9.0:
+                                    try:
+                                        requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                                                      json={"chat_id": TG_CHAT_ID, "text": f"💎 PRON: @{cand} ({sc:.1f})",
+                                                            "parse_mode": "Markdown"}, timeout=10)
+                                    except: pass
+                                print(f"🗣️ PRON: @{cand} (score {sc:.1f})")
+                            elif status is False:
+                                print(f"❌ @{cand}")
+                            else:
+                                print(f"⚠️ @{cand}")
+                            if chk % 2000 == 0:
+                                with open(TRIED_FILE, "a") as f:
+                                    for u in list(tried)[-500:]:
+                                        f.write(u + "\n")
+                        batch.clear()
+                        await asyncio.sleep(BATCH_DELAY)
+
+        finally:
+            stop_event.set()
+            vip_thread.join(timeout=5)
 
     with open(TRIED_FILE, "w") as f:
         for u in tried:
